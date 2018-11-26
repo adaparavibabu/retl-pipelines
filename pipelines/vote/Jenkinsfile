@@ -1,0 +1,82 @@
+pipeline {
+    environment {
+        RELEASE_ID = '0.1.0'
+        IMAGE_NAME = 'vote'
+        K8S_ENV = 'ns-vote'
+        ACR_CREDS = credentials('ACR_CREDS')
+        ACR_SERVER = 'obcontainerregistry.azurecr.io'
+    }
+    agent any
+    stages {
+        stage('Build') { 
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: 'refs/heads/develop']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[url: 'https://github.com/adaparavibabu/retl-demo-vote.git']]])
+                sh """cd ${WORKSPACE} && \\
+                    docker build . -t \${ACR_SERVER}/\${IMAGE_NAME}:\${RELEASE_ID}-${env.BUILD_ID}"""
+            }
+        }
+        stage('SpinUp a Full Stack Test Environment') {
+            steps {
+                sh """echo "Spinup a test environment if doesnt exist"
+                    if [ ! -z "\$(kubectl get ns ${K8S_ENV} -o name 2>/dev/null)" ]; then
+                        echo "\${K8S_ENV} Environment already exists"
+                        kubectl config set-context \$(kubectl config current-context) --namespace=\${K8S_ENV}                        
+                        if [ ! -z "\$(kubectl get secret azure-acr -o name 2>/dev/null)" ]; then
+                            echo "ACR Secrets already exists"
+                        else 
+                            kubectl create secret docker-registry azure-acr --docker-server=\${ACR_SERVER} --docker-username=\${ACR_CREDS_USR} --docker-password=\${ACR_CREDS_PSW}
+                        fi
+                    else
+                        kubectl create ns \${K8S_ENV} &&
+                        kubectl config set-context \$(kubectl config current-context) --namespace=\${K8S_ENV}
+                        kubectl create secret docker-registry azure-acr --docker-server=\${ACR_SERVER} --docker-username=\${ACR_CREDS_USR} --docker-password=\${ACR_CREDS_PSW}
+                    fi"""
+                    
+                checkout([$class: 'GitSCM', branches: [[name: 'refs/heads/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'charts']], submoduleCfg: [], userRemoteConfigs: [[url: 'https://github.com/adaparavibabu/retl-charts.git']]])
+                    
+                sh returnStdout: true, script: """cd ${WORKSPACE}/charts && \\
+                    printf "\n%s\n" "Deploying Users UI service" && \\
+                    kubectl apply -f ui.yml
+                    printf "\n%s\n" "Deploying Queue management service" && \\
+                    kubectl apply -f queue.yml
+                    printf "\n%s\n" "Deploying Collector Service" && \\
+                    kubectl apply -f worker.yml
+                    printf "\n%s\n" "Deploying DB Service" && \\
+                    kubectl apply -f db.yml
+                    printf "\n%s\n" "Deploying Results frontend service" && \\
+                    kubectl apply -f result.yml"""
+            }
+        }
+        stage('Publish'){
+            steps {
+               sh returnStdout: true, script: """az acr login --name obContainerRegistry && \\
+                    docker push "${ACR_SERVER}/${IMAGE_NAME}:${RELEASE_ID}-${env.BUILD_ID}"
+                """                
+            }
+        }        
+        stage('Deploy') {
+            steps {
+                sh returnStdout: true, script: """printf "\n%s\n" "Build image is \${ACR_SERVER}/\${IMAGE_NAME}:\${RELEASE_ID}-${env.BUILD_ID}"
+                    sed -i 's/${IMAGE_NAME}:v0.1/${IMAGE_NAME}:${RELEASE_ID}-${env.BUILD_ID}/g' ${WORKSPACE}/charts/ui.yml
+                    printf "\n%s\n" "Deploying \${IMAGE_NAME}:\${RELEASE_ID}-${env.BUILD_ID} to test Environment" && \\
+                    kubectl apply -f ${WORKSPACE}/charts/ui.yml
+                    """
+            }
+        }
+        stage('Test'){
+            steps {
+                
+                sh returnStdout: true, script: """ export OUT='http_code'
+                    export VOTE_LB="\$(kubectl describe svc vote|grep Ingress|awk -F \' \' \'{print \$3}\')"
+                    export RESULT_LB="\$(kubectl describe svc result|grep Ingress|awk -F \' \' \'{print \$3}\')"
+                    export RESULT_URL="http://\${RESULT_LB}:5001"
+                    export VOTE_URL="http://\${VOTE_LB}:5000"
+                    export V_RESULT="\$(curl --output /dev/null --silent --connect-timeout 5 --max-time 5 --retry 5 --retry-delay 5 --retry-max-time 30 --write-out \\"%{\${OUT}}\\" \${VOTE_URL})"
+                    export R_RESULT="\$(curl --output /dev/null --silent --connect-timeout 5 --max-time 5 --retry 5 --retry-delay 5 --retry-max-time 30 --write-out \\"%{\${OUT}}\\" \${RESULT_URL})"
+                    printf "\n\n%s\n" "Test Results for Users UI Service is \${V_RESULT}"
+                    printf "\n%s\n\n" "Test Results of Results UI Service is \${R_RESULT}"
+                    """
+            }
+        }
+    }
+}
